@@ -389,12 +389,10 @@ async def send_scheduled_update(context: ContextTypes.DEFAULT_TYPE):
 
         # Remove the 'Application' line as per your request
 
-        date_posted = internship.get('Date Posted')
-        date_posted_str = date_posted.strftime('%b %d, %Y') if date_posted else "N/A"
         message_parts.append(f"*Date Posted*: {date_posted_str}")
 
         # Combine all parts into the final message
-        message = '\n'.join(message_parts)
+        internship_message = '\n'.join(message_parts) + '\n\n'
         if len(current_message) + len(internship_message) > 4000:
             messages.append(current_message)
             current_message = internship_message
@@ -420,7 +418,15 @@ def main():
     # Migrate the database schema
     migrate_db()
 
+    # Create the Application and pass the bot's token
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Ensure that JobQueue is properly initialized
+    job_queue = application.job_queue
+
+    if job_queue is None:
+        print("JobQueue is not initialized correctly. Ensure the proper version of python-telegram-bot is installed.")
+        return
 
     # Command handlers
     application.add_handler(CommandHandler('start', start))
@@ -436,7 +442,6 @@ def main():
         },
         fallbacks=[],
     )
-
     frequency_conv_handler = ConversationHandler(
         entry_points=[CommandHandler('setfrequency', set_frequency)],
         states={
@@ -450,7 +455,7 @@ def main():
 
     # Schedule the jobs for existing users
     for chat_id, update_time_str, frequency in get_all_users():
-        schedule_user_job(application.job_queue, chat_id)
+        schedule_user_job(job_queue, chat_id)
 
     # Start the bot
     application.run_polling()
