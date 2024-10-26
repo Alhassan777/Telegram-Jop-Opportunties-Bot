@@ -427,6 +427,11 @@ async def send_scheduled_update(context: ContextTypes.DEFAULT_TYPE):
             link = escape_markdown(link, version=2)
             message_parts.append(f"[Link]({link})")
 
+        # Remove the 'Application' line as per your request
+
+        message_parts.append(f"*Date Posted*: {date_posted_str}")
+
+        # Combine all parts into the final message
         internship_message = '\n'.join(message_parts) + '\n\n'
         if len(current_message) + len(internship_message) > 4000:
             messages.append(current_message)
@@ -458,6 +463,13 @@ def main():
 
     # Access the JobQueue
     job_queue = application.job_queue
+
+    # Ensure that JobQueue is properly initialized
+    job_queue = application.job_queue
+
+    if job_queue is None:
+        print("JobQueue is not initialized correctly. Ensure the proper version of python-telegram-bot is installed.")
+        return
 
     # Command handlers
     application.add_handler(CommandHandler('start', start))
