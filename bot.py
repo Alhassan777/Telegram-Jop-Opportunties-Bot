@@ -1,11 +1,16 @@
+import os
+import sqlite3
+import logging
+from datetime import datetime, timedelta
+
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
 from dateutil.parser import parse as parse_date
 import markdown
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
-
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -14,11 +19,15 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-import os
-import sqlite3
 
-from dotenv import load_dotenv
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # URL of the raw README.md file containing the internships
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/SimplifyJobs/Summer2025-Internships/master/README.md"
@@ -40,6 +49,13 @@ def init_db():
             chat_id INTEGER PRIMARY KEY,
             update_time TEXT DEFAULT '09:00',  -- Default update time is 09:00 AM UTC
             frequency INTEGER DEFAULT 24      -- Default frequency is every 24 hours
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sent_internships (
+            chat_id INTEGER,
+            internship_id TEXT,
+            PRIMARY KEY (chat_id, internship_id)
         )
     ''')
     conn.commit()
@@ -74,6 +90,7 @@ def remove_user(chat_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('DELETE FROM users WHERE chat_id = ?', (chat_id,))
+    cursor.execute('DELETE FROM sent_internships WHERE chat_id = ?', (chat_id,))
     conn.commit()
     conn.close()
 
@@ -112,10 +129,10 @@ async def get_internships():
         response = requests.get(GITHUB_RAW_URL)
         response.raise_for_status()
     except requests.exceptions.HTTPError as http_err:
-        print(f"HTTP error occurred: {http_err}")
+        logger.error(f"HTTP error occurred: {http_err}")
         return []
     except Exception as err:
-        print(f"An error occurred: {err}")
+        logger.error(f"An error occurred: {err}")
         return []
 
     # Convert markdown to HTML
@@ -127,7 +144,7 @@ async def get_internships():
     # Find all tables in the HTML
     tables = soup.find_all('table')
     if not tables:
-        print("Error: Could not find any table element on the page.")
+        logger.error("Error: Could not find any table element on the page.")
         return []
 
     # Assuming the internships are in the first table
@@ -179,7 +196,7 @@ async def get_internships():
             elif header == 'Date Posted':
                 try:
                     date_posted = parse_date(text)
-                except ValueError:
+                except (ValueError, TypeError):
                     date_posted = None
                 internship_entry['Date Posted'] = date_posted
             else:
@@ -256,14 +273,30 @@ async def updates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for internship in latest_internships:
         date_posted = internship.get('Date Posted')
         date_posted_str = date_posted.strftime('%b %d, %Y') if date_posted else "N/A"
-        internship_message = (
-            f"*Company*: {internship.get('Company', 'N/A')}\n"
-            f"*Role*: {internship.get('Role', 'N/A')}\n"
-            f"*Location*: {internship.get('Location', 'N/A')}\n"
-            f"[Link]({internship.get('Link', 'N/A')})\n"
-            f"[Application]({internship.get('Application/Link', 'N/A')})\n"
-            f"*Date Posted*: {date_posted_str}\n\n"
-        )
+
+        company_name = escape_markdown(internship.get('Company', 'N/A'), version=2)
+        role = escape_markdown(internship.get('Role', 'N/A'), version=2)
+        location = escape_markdown(internship.get('Location', 'N/A'), version=2)
+        date_posted_str = escape_markdown(date_posted_str, version=2)
+
+        message_parts = [
+            f"*Company*: {company_name}",
+            f"*Role*: {role}",
+            f"*Location*: {location}",
+            f"*Date Posted*: {date_posted_str}",
+        ]
+
+        link = internship.get('Link')
+        if link:
+            link = escape_markdown(link, version=2)
+            message_parts.append(f"[Link]({link})")
+
+        application_link = internship.get('Application/Link')
+        if application_link:
+            application_link = escape_markdown(application_link, version=2)
+            message_parts.append(f"[Application]({application_link})")
+
+        internship_message = '\n'.join(message_parts) + '\n\n'
         if len(current_message) + len(internship_message) > 4000:
             messages.append(current_message)
             current_message = internship_message
@@ -274,7 +307,7 @@ async def updates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages.append(current_message)
 
     for message in messages:
-        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN_V2)
 
 async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -330,8 +363,9 @@ def schedule_user_job(job_queue, chat_id):
     frequency_timedelta = timedelta(hours=frequency)
 
     # Schedule a new job for this user
-    next_run_time = datetime.utcnow().replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if next_run_time < datetime.utcnow():
+    now = datetime.utcnow()
+    next_run_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if next_run_time < now:
         next_run_time += timedelta(days=1)
 
     job_queue.run_repeating(
@@ -348,13 +382,12 @@ async def send_scheduled_update(context: ContextTypes.DEFAULT_TYPE):
     if not internships:
         return
 
-    # Load previously sent internships to avoid duplicates
-    sent_internships_file = f'sent_internships_{chat_id}.txt'
-    if os.path.exists(sent_internships_file):
-        with open(sent_internships_file, 'r') as f:
-            sent_internships = set(f.read().splitlines())
-    else:
-        sent_internships = set()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Retrieve sent internships for this user
+    cursor.execute('SELECT internship_id FROM sent_internships WHERE chat_id = ?', (chat_id,))
+    sent_internships = set(row[0] for row in cursor.fetchall())
 
     new_internships = []
     for internship in internships:
@@ -362,39 +395,39 @@ async def send_scheduled_update(context: ContextTypes.DEFAULT_TYPE):
         if identifier not in sent_internships:
             new_internships.append(internship)
             sent_internships.add(identifier)
+            # Insert into database
+            cursor.execute('INSERT INTO sent_internships (chat_id, internship_id) VALUES (?, ?)', (chat_id, identifier))
+
+    conn.commit()
+    conn.close()
 
     if not new_internships:
         return
-
-    # Save updated sent internships
-    with open(sent_internships_file, 'w') as f:
-        for identifier in sent_internships:
-            f.write(f"{identifier}\n")
 
     messages = []
     current_message = ""
     for internship in new_internships:
         date_posted = internship.get('Date Posted')
         date_posted_str = date_posted.strftime('%b %d, %Y') if date_posted else "N/A"
+
+        company_name = escape_markdown(internship.get('Company', 'N/A'), version=2)
+        role = escape_markdown(internship.get('Role', 'N/A'), version=2)
+        location = escape_markdown(internship.get('Location', 'N/A'), version=2)
+        date_posted_str = escape_markdown(date_posted_str, version=2)
+
         message_parts = [
-            f"*Company*: {internship.get('Company', 'N/A')}",
-            f"*Role*: {internship.get('Role', 'N/A')}",
-            f"*Location*: {internship.get('Location', 'N/A')}",
+            f"*Company*: {company_name}",
+            f"*Role*: {role}",
+            f"*Location*: {location}",
+            f"*Date Posted*: {date_posted_str}",
         ]
 
-        # Include the link only if it's available
         link = internship.get('Link')
         if link:
+            link = escape_markdown(link, version=2)
             message_parts.append(f"[Link]({link})")
 
-        # Remove the 'Application' line as per your request
-
-        date_posted = internship.get('Date Posted')
-        date_posted_str = date_posted.strftime('%b %d, %Y') if date_posted else "N/A"
-        message_parts.append(f"*Date Posted*: {date_posted_str}")
-
-        # Combine all parts into the final message
-        message = '\n'.join(message_parts)
+        internship_message = '\n'.join(message_parts) + '\n\n'
         if len(current_message) + len(internship_message) > 4000:
             messages.append(current_message)
             current_message = internship_message
@@ -409,10 +442,10 @@ async def send_scheduled_update(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=message,
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.MARKDOWN_V2
             )
         except Exception as e:
-            print(f"Failed to send message to {chat_id}: {e}")
+            logger.error(f"Failed to send message to {chat_id}: {e}")
 
 def main():
     # Initialize the database
@@ -420,7 +453,11 @@ def main():
     # Migrate the database schema
     migrate_db()
 
+    # Create the Application and pass the bot's token
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Access the JobQueue
+    job_queue = application.job_queue
 
     # Command handlers
     application.add_handler(CommandHandler('start', start))
@@ -436,7 +473,6 @@ def main():
         },
         fallbacks=[],
     )
-
     frequency_conv_handler = ConversationHandler(
         entry_points=[CommandHandler('setfrequency', set_frequency)],
         states={
@@ -450,10 +486,13 @@ def main():
 
     # Schedule the jobs for existing users
     for chat_id, update_time_str, frequency in get_all_users():
-        schedule_user_job(application.job_queue, chat_id)
+        schedule_user_job(job_queue, chat_id)
 
     # Start the bot
     application.run_polling()
 
 if __name__ == '__main__':
-    main()
+    if TELEGRAM_BOT_TOKEN is None:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable not set.")
+    else:
+        main()
