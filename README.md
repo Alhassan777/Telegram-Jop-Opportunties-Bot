@@ -1,5 +1,3 @@
-# @JopOppBot 📢
-
 @JopOppBot is a Telegram bot that keeps you updated with the latest job and internship opportunities from the GitHub repository [SimplifyJobs/Summer2025-Internships](https://github.com/SimplifyJobs/Summer2025-Internships). The bot automatically sends you new listings every 12 hours, ensuring you never miss out on fresh opportunities.
 
 ## Features 📋
